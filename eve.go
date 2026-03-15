@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/nicklaw5/helix/v2"
 	"github.com/pixelrazor/evebot/icon"
 )
 
@@ -119,10 +121,43 @@ func main() {
 	key := "Bot " + envKey
 	dg, _ := discordgo.New(key)
 
+	twitchClientID, ok := os.LookupEnv("TWITCH_CLIENT_ID")
+	if !ok {
+		log.Fatalln("Failed to find TWITCH_CLIENT_ID in env")
+	}
+	twitchClientSecret, ok := os.LookupEnv("TWITCH_CLIENT_SECRET")
+	if !ok {
+		log.Fatalln("Failed to find TWITCH_CLIENT_SECRET in env")
+	}
+	callbackURL, ok := os.LookupEnv("CALLBACK_URL")
+	if !ok {
+		log.Fatalln("Failed to find CALLBACK_URL in env")
+	}
+	callbackURL = strings.TrimSpace(callbackURL)
+	callbackURL = strings.TrimSuffix(callbackURL, "/")
+
+	tc, err := helix.NewClient(&helix.Options{
+		ClientID:     twitchClientID,
+		ClientSecret: twitchClientSecret,
+	})
+	if err != nil {
+		log.Fatalln("Failed to create twitch client:", err)
+	}
+
+	// Get app access token
+	tresp, err := tc.RequestAppAccessToken([]string{})
+	if err != nil {
+		log.Fatalln("Failed to request twitch app access token:", err)
+	}
+	tc.SetAppAccessToken(tresp.Data.AccessToken)
+
 	bot := EveBot{
-		s:      dg,
-		repo:   repo,
-		random: rand.New(rand.NewSource(time.Now().UnixNano())),
+		s:            dg,
+		repo:         repo,
+		random:       rand.New(rand.NewSource(time.Now().UnixNano())),
+		twitch:       tc,
+		twitchSecret: twitchClientSecret,
+		callbackURL:  callbackURL,
 	}
 
 	bot.handlers()
@@ -136,6 +171,7 @@ func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "I'm alive")
 	})
+	http.HandleFunc("/twitch/eventsub", bot.handleTwitchEventSub)
 	http.ListenAndServe(":8086", nil)
 
 	log.Println("peace out")
@@ -267,9 +303,12 @@ func updateIconAndStatus(s *discordgo.Session, random *rand.Rand) error {
 }
 
 type EveBot struct {
-	s      *discordgo.Session
-	repo   DataRepository
-	random *rand.Rand
+	s            *discordgo.Session
+	repo         DataRepository
+	random       *rand.Rand
+	twitch       *helix.Client
+	twitchSecret string
+	callbackURL  string
 }
 
 type EveBotInteraction struct {
@@ -366,6 +405,28 @@ func (eb *EveBot) registeredInteractions() []EveBotInteraction {
 			},
 			handler: minfoHandler,
 		},
+		{
+			command: &discordgo.ApplicationCommand{
+				Name:        "twitch",
+				Description: "Manage Twitch integration",
+				Options: []*discordgo.ApplicationCommandOption{
+					{
+						Type:        discordgo.ApplicationCommandOptionSubCommand,
+						Name:        "link",
+						Description: "Link your Twitch account",
+						Options: []*discordgo.ApplicationCommandOption{
+							{
+								Type:        discordgo.ApplicationCommandOptionString,
+								Name:        "username",
+								Description: "Your Twitch username",
+								Required:    true,
+							},
+						},
+					},
+				},
+			},
+			handler: eb.twitchHandler,
+		},
 	}
 }
 
@@ -386,6 +447,7 @@ func (eb *EveBot) handlers() {
 	eb.s.AddHandler(eb.handleMemberRemove())
 	eb.s.AddHandler(eb.handleMessageDelete())
 	eb.s.AddHandler(eb.handleMessageCreate())
+	eb.s.AddHandler(eb.handleMemberUpdate())
 	eb.s.Identify.Intents = discordgo.IntentsGuilds |
 		discordgo.IntentsGuildMembers |
 		discordgo.IntentsGuildMessages |
@@ -425,7 +487,151 @@ func (eb *EveBot) handleOnReady() interface{} {
 			go eb.mute(s, member, time.Until(mutedUntil))
 		}
 		applyRoles(s, permanentRoles)
+		eb.syncStreamers()
 		log.Println("Eve bot is ready")
+	}
+}
+
+func (eb *EveBot) handleMemberUpdate() interface{} {
+	return func(s *discordgo.Session, m *discordgo.GuildMemberUpdate) {
+		if m.GuildID != guildID {
+			return
+		}
+		isStreamer := false
+		for _, role := range m.Roles {
+			if role == streamerRole {
+				isStreamer = true
+				break
+			}
+		}
+
+		if isStreamer {
+			eb.subscribeToStreamer(m.User.ID, m.User.Username)
+		} else {
+			eb.unsubscribeFromStreamer(m.User.ID)
+		}
+	}
+}
+
+func (eb *EveBot) syncStreamers() {
+	members, err := eb.s.GuildMembers(guildID, "", 1000)
+	if err != nil {
+		log.Println("Error getting members for syncStreamers:", err)
+		return
+	}
+
+	for _, m := range members {
+		isStreamer := false
+		for _, role := range m.Roles {
+			if role == streamerRole {
+				isStreamer = true
+				break
+			}
+		}
+		if isStreamer {
+			eb.subscribeToStreamer(m.User.ID, m.User.Username)
+		}
+	}
+}
+
+func (eb *EveBot) subscribeToStreamer(discordID, discordName string) {
+	twitchID, twitchName, err := eb.repo.GetTwitch(discordID)
+	if err != nil {
+		// Not in DB, try to find it in presence?
+		// For now we skip, but we could try to look it up if we had a way.
+		return
+	}
+
+	callback := eb.callbackURL + "/twitch/eventsub"
+	log.Printf("Subscribing to %s (%s) with callback: %s\n", twitchName, discordID, callback)
+	res, err := eb.twitch.CreateEventSubSubscription(&helix.EventSubSubscription{
+		Type:    helix.EventSubTypeStreamOnline,
+		Version: "1",
+		Condition: helix.EventSubCondition{
+			BroadcasterUserID: twitchID,
+		},
+		Transport: helix.EventSubTransport{
+			Method:   "webhook",
+			Callback: callback,
+			Secret:   eb.twitchSecret,
+		},
+	})
+	if err != nil {
+		log.Printf("Failed to subscribe to streamer %s (%s): %v\n", twitchName, discordID, err)
+		return
+	}
+	if res.StatusCode >= 300 {
+		log.Printf("Twitch API Error subscribing to %s (%s): %s (Status: %d)\n", twitchName, discordID, res.ErrorMessage, res.StatusCode)
+		return
+	}
+	log.Printf("Successfully requested Twitch subscription for %s (%s). Status: %s\n", twitchName, discordID, res.Data.EventSubSubscriptions[0].Status)
+}
+
+func (eb *EveBot) unsubscribeFromStreamer(discordID string) {
+	twitchID, _, err := eb.repo.GetTwitch(discordID)
+	if err != nil {
+		return
+	}
+	// We need the subscription ID to unsubscribe.
+	// For simplicity, we could just let it fail or we could list all subscriptions and find the right one.
+	resp, err := eb.twitch.GetEventSubSubscriptions(&helix.EventSubSubscriptionsParams{
+		Status: helix.EventSubStatusEnabled,
+	})
+	if err != nil {
+		log.Println("Error getting subscriptions for unsubscribe:", err)
+		return
+	}
+	for _, sub := range resp.Data.EventSubSubscriptions {
+		if sub.Condition.BroadcasterUserID == twitchID {
+			eb.twitch.RemoveEventSubSubscription(sub.ID)
+			log.Printf("Successfully unsubscribed from %s", twitchID)
+			eb.repo.DeleteTwitch(discordID)
+		}
+	}
+}
+
+func (eb *EveBot) handleTwitchEventSub(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Println("Error reading eventsub body:", err)
+		return
+	}
+	defer r.Body.Close()
+
+	if !helix.VerifyEventSubNotification(eb.twitchSecret, r.Header, string(body)) {
+		log.Println("Invalid eventsub signature. Body:", string(body))
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	var vals struct {
+		Challenge string `json:"challenge"`
+		Event     struct {
+			BroadcasterUserID    string `json:"broadcaster_user_id"`
+			BroadcasterUserLogin string `json:"broadcaster_user_login"`
+			BroadcasterUserName  string `json:"broadcaster_user_name"`
+		} `json:"event"`
+		Subscription struct {
+			Type string `json:"type"`
+		} `json:"subscription"`
+	}
+	if err := json.Unmarshal(body, &vals); err != nil {
+		log.Println("Error unmarshaling eventsub body:", err)
+		return
+	}
+
+	if vals.Challenge != "" {
+		w.Write([]byte(vals.Challenge))
+		return
+	}
+
+	if vals.Subscription.Type == helix.EventSubTypeStreamOnline {
+		log.Printf("Twitch EventSub: %s is now live\n", vals.Event.BroadcasterUserName)
+		mesg := fmt.Sprintf("%s is now live on Twitch! https://twitch.tv/%s", vals.Event.BroadcasterUserName, vals.Event.BroadcasterUserLogin)
+		_, err := eb.s.ChannelMessageSend(streamChannel, mesg)
+		if err != nil {
+			log.Println("Error sending stream start message:", err)
+		}
 	}
 }
 
@@ -454,6 +660,18 @@ func (eb *EveBot) handlePresenceUpdate() interface{} {
 			if activity.Type != discordgo.ActivityTypeStreaming || activity.State != "League of Legends" {
 				continue
 			}
+
+			if strings.Contains(activity.URL, "twitch.tv/") {
+				parts := strings.Split(activity.URL, "/")
+				login := parts[len(parts)-1]
+				// Get User ID from Twitch
+				res, err := eb.twitch.GetUsers(&helix.UsersParams{Logins: []string{login}})
+				if err == nil && len(res.Data.Users) > 0 {
+					eb.repo.AddTwitch(p.User.ID, res.Data.Users[0].ID, res.Data.Users[0].Login)
+					eb.subscribeToStreamer(p.User.ID, p.User.Username)
+				}
+			}
+
 			if isStreaming[p.User.ID].IsZero() || time.Since(isStreaming[p.User.ID]) > 4*time.Hour {
 				mesg := activity.Details + "\n"
 				_, err := s.ChannelMessageSend(streamChannel, mesg+activity.URL)

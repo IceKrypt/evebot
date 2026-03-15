@@ -24,20 +24,33 @@ type DataRepository interface {
 	IncrementLeave(month string)
 	// TODO: merge the join/leave getters
 	GetAllLeave() map[string]int
+
+	// Twitch related storage
+	AddTwitch(discordID, twitchID, twitchName string)
+	GetTwitch(discordID string) (twitchID, twitchName string, err error)
+	DeleteTwitch(discordID string)
+	GetAllTwitch() map[string]string // discordID -> twitchID
 }
 
 type MemoryRepo struct {
-	join  map[string]int
-	leave map[string]int
-	muted map[string]time.Time
+	join   map[string]int
+	leave  map[string]int
+	muted  map[string]time.Time
+	stream map[string]twitchInfo // discordID -> twitchInfo
 	sync.RWMutex
+}
+
+type twitchInfo struct {
+	id   string
+	name string
 }
 
 func NewMemoryRepo() *MemoryRepo {
 	return &MemoryRepo{
-		join:  make(map[string]int),
-		leave: make(map[string]int),
-		muted: make(map[string]time.Time),
+		join:   make(map[string]int),
+		leave:  make(map[string]int),
+		muted:  make(map[string]time.Time),
+		stream: make(map[string]twitchInfo),
 	}
 }
 
@@ -103,6 +116,38 @@ func (mr *MemoryRepo) GetAllLeave() map[string]int {
 	ret := make(map[string]int)
 	for k, v := range mr.leave {
 		ret[k] = v
+	}
+	return ret
+}
+
+func (mr *MemoryRepo) AddTwitch(discordID, twitchID, twitchName string) {
+	mr.Lock()
+	defer mr.Unlock()
+	mr.stream[discordID] = twitchInfo{id: twitchID, name: twitchName}
+}
+
+func (mr *MemoryRepo) GetTwitch(discordID string) (string, string, error) {
+	mr.RLock()
+	defer mr.RUnlock()
+	info, ok := mr.stream[discordID]
+	if !ok {
+		return "", "", errors.New("twitch info not found")
+	}
+	return info.id, info.name, nil
+}
+
+func (mr *MemoryRepo) DeleteTwitch(discordID string) {
+	mr.Lock()
+	defer mr.Unlock()
+	delete(mr.stream, discordID)
+}
+
+func (mr *MemoryRepo) GetAllTwitch() map[string]string {
+	mr.RLock()
+	defer mr.RUnlock()
+	ret := make(map[string]string)
+	for k, v := range mr.stream {
+		ret[k] = v.id
 	}
 	return ret
 }
@@ -235,4 +280,50 @@ func (pr *PostgresRepo) GetAllLeave() map[string]int {
 		log.Println("Error during leave count row iteration:", err)
 	}
 	return leave
+}
+
+func (pr *PostgresRepo) AddTwitch(discordID, twitchID, twitchName string) {
+	_, err := pr.db.Exec("INSERT INTO streamers (discord_id, twitch_id, twitch_name) VALUES ($1, $2, $3) ON CONFLICT (discord_id) DO UPDATE SET twitch_id = EXCLUDED.twitch_id, twitch_name = EXCLUDED.twitch_name", discordID, twitchID, twitchName)
+	if err != nil {
+		log.Println("Failed inserting streamer info:", err)
+	}
+}
+
+func (pr *PostgresRepo) GetTwitch(discordID string) (string, string, error) {
+	var twitchID, twitchName string
+	err := pr.db.QueryRow("SELECT twitch_id, twitch_name FROM streamers WHERE discord_id = $1", discordID).Scan(&twitchID, &twitchName)
+	if err != nil {
+		return "", "", err
+	}
+	return twitchID, twitchName, nil
+}
+
+func (pr *PostgresRepo) DeleteTwitch(discordID string) {
+	_, err := pr.db.Exec("DELETE FROM streamers WHERE discord_id = $1", discordID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Println("Failed to delete streamer info:", err)
+	}
+}
+
+func (pr *PostgresRepo) GetAllTwitch() map[string]string {
+	streamers := make(map[string]string)
+	rows, err := pr.db.Query("SELECT discord_id, twitch_id FROM streamers")
+	if err != nil {
+		log.Println("Failed to get streamers:", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var discordID, twitchID string
+		err := rows.Scan(&discordID, &twitchID)
+		if err != nil {
+			log.Println("Failed scanning streamer data:", err)
+			return streamers
+		}
+		streamers[discordID] = twitchID
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Println("Error during streamers row iteration:", err)
+	}
+	return streamers
 }

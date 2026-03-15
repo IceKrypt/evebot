@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/nicklaw5/helix/v2"
 )
 
 func sinfoHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -249,4 +250,49 @@ func (eb *EveBot) muteHandler(s *discordgo.Session, i *discordgo.InteractionCrea
 func (eb *EveBot) doMute(s *discordgo.Session, userID string, dur time.Duration) error {
 	eb.muteMember(s, userID, dur)
 	return nil
+}
+
+func (eb *EveBot) twitchHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	switch i.ApplicationCommandData().Options[0].Name {
+	case "link":
+		username := i.ApplicationCommandData().Options[0].Options[0].StringValue()
+		// Get Twitch ID
+		res, err := eb.twitch.GetUsers(&helix.UsersParams{Logins: []string{username}})
+		if err != nil || len(res.Data.Users) == 0 {
+			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: fmt.Sprintf("Error finding Twitch user %s: %v", username, err),
+					Flags:   discordgo.MessageFlagsEphemeral,
+				},
+			})
+			return
+		}
+
+		user := res.Data.Users[0]
+		eb.repo.AddTwitch(i.Member.User.ID, user.ID, user.Login)
+
+		// Check if member has streamer role
+		member, err := GuildMember(s, i.GuildID, i.Member.User.ID)
+		if err == nil {
+			isStreamer := false
+			for _, role := range member.Roles {
+				if role == streamerRole {
+					isStreamer = true
+					break
+				}
+			}
+			if isStreamer {
+				eb.subscribeToStreamer(i.Member.User.ID, i.Member.User.Username)
+			}
+		}
+
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: fmt.Sprintf("Linked Twitch account: %s (ID: %s). I'll notify when you go live!", user.Login, user.ID),
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+	}
 }

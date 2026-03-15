@@ -8,3 +8,9 @@ CREATE TABLE IF NOT EXISTS monthly_stats (
     members_joined INT,
     members_left INT
 );
+
+CREATE TABLE IF NOT EXISTS streamers (
+    discord_id TEXT PRIMARY KEY,
+    twitch_id TEXT,
+    twitch_name TEXT
+);
