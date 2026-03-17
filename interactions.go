@@ -262,7 +262,7 @@ func (eb *EveBot) twitchHandler(s *discordgo.Session, i *discordgo.InteractionCr
 			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 				Type: discordgo.InteractionResponseChannelMessageWithSource,
 				Data: &discordgo.InteractionResponseData{
-					Content: fmt.Sprintf("Error finding Twitch user %s: %v", username, err),
+					Content: fmt.Sprintf("Error finding Twitch user %v: %v", username, err),
 					Flags:   discordgo.MessageFlagsEphemeral,
 				},
 			})
@@ -290,7 +290,7 @@ func (eb *EveBot) twitchHandler(s *discordgo.Session, i *discordgo.InteractionCr
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
-				Content: fmt.Sprintf("Linked Twitch account: %s (ID: %s). I'll notify when you go live!", user.Login, user.ID),
+				Content: fmt.Sprintf("Linked Twitch account: %v (ID: %v). I'll notify when you go live!", user.Login, user.ID),
 				Flags:   discordgo.MessageFlagsEphemeral,
 			},
 		})

@@ -145,7 +145,7 @@ func main() {
 	}
 
 	// Get app access token
-	tresp, err := tc.RequestAppAccessToken([]string{})
+	tresp, err := tc.RequestAppAccessToken(nil)
 	if err != nil {
 		log.Fatalln("Failed to request twitch app access token:", err)
 	}
@@ -497,18 +497,21 @@ func (eb *EveBot) handleMemberUpdate() interface{} {
 		if m.GuildID != guildID {
 			return
 		}
+		// m.Roles might not be complete or up to date in some cases. Fetch latest to be sure.
+		member, err := GuildMember(s, m.GuildID, m.User.ID)
+		if err != nil {
+			log.Println("Error getting member for handleMemberUpdate:", err)
+			return
+		}
 		isStreamer := false
-		for _, role := range m.Roles {
+		for _, role := range member.Roles {
 			if role == streamerRole {
 				isStreamer = true
 				break
 			}
 		}
-
-		if isStreamer {
-			eb.subscribeToStreamer(m.User.ID, m.User.Username)
-		} else {
-			eb.unsubscribeFromStreamer(m.User.ID)
+		if !isStreamer {
+			eb.unsubscribeFromStreamer(member.User.ID)
 		}
 	}
 }
@@ -543,7 +546,7 @@ func (eb *EveBot) subscribeToStreamer(discordID, discordName string) {
 	}
 
 	callback := eb.callbackURL + "/twitch/eventsub"
-	log.Printf("Subscribing to %s (%s) with callback: %s\n", twitchName, discordID, callback)
+	log.Printf("Subscribing to %v (%v) with callback: %v\n", twitchName, discordID, callback)
 	res, err := eb.twitch.CreateEventSubSubscription(&helix.EventSubSubscription{
 		Type:    helix.EventSubTypeStreamOnline,
 		Version: "1",
@@ -557,14 +560,14 @@ func (eb *EveBot) subscribeToStreamer(discordID, discordName string) {
 		},
 	})
 	if err != nil {
-		log.Printf("Failed to subscribe to streamer %s (%s): %v\n", twitchName, discordID, err)
+		log.Printf("Failed to subscribe to streamer %v (%v): %v\n", twitchName, discordID, err)
 		return
 	}
 	if res.StatusCode >= 300 {
-		log.Printf("Twitch API Error subscribing to %s (%s): %s (Status: %d)\n", twitchName, discordID, res.ErrorMessage, res.StatusCode)
+		log.Printf("Twitch API Error subscribing to %v (%v): %v (Status: %d)\n", twitchName, discordID, res.ErrorMessage, res.StatusCode)
 		return
 	}
-	log.Printf("Successfully requested Twitch subscription for %s (%s). Status: %s\n", twitchName, discordID, res.Data.EventSubSubscriptions[0].Status)
+	log.Printf("Successfully requested Twitch subscription for %v (%v). Status: %v\n", twitchName, discordID, res.Data.EventSubSubscriptions[0].Status)
 }
 
 func (eb *EveBot) unsubscribeFromStreamer(discordID string) {
@@ -584,7 +587,7 @@ func (eb *EveBot) unsubscribeFromStreamer(discordID string) {
 	for _, sub := range resp.Data.EventSubSubscriptions {
 		if sub.Condition.BroadcasterUserID == twitchID {
 			eb.twitch.RemoveEventSubSubscription(sub.ID)
-			log.Printf("Successfully unsubscribed from %s", twitchID)
+			log.Printf("Successfully unsubscribed from %v", twitchID)
 			eb.repo.DeleteTwitch(discordID)
 		}
 	}
@@ -625,13 +628,13 @@ func (eb *EveBot) handleTwitchEventSub(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if vals.Subscription.Type == helix.EventSubTypeStreamOnline {
-		log.Printf("Twitch EventSub: %s is now live\n", vals.Event.BroadcasterUserName)
-		mesg := fmt.Sprintf("%s is now live on Twitch! https://twitch.tv/%s", vals.Event.BroadcasterUserName, vals.Event.BroadcasterUserLogin)
-		_, err := eb.s.ChannelMessageSend(streamChannel, mesg)
-		if err != nil {
-			log.Println("Error sending stream start message:", err)
-		}
+	if vals.Subscription.Type != helix.EventSubTypeStreamOnline {
+		return
+	}
+	log.Printf("Twitch EventSub: %v is now live\n", vals.Event.BroadcasterUserName)
+	mesg := fmt.Sprintf("%v is now live on Twitch! https://twitch.tv/%v", vals.Event.BroadcasterUserName, vals.Event.BroadcasterUserLogin)
+	if _, err = eb.s.ChannelMessageSend(streamChannel, mesg); err != nil {
+		log.Println("Error sending stream start message:", err)
 	}
 }
 
